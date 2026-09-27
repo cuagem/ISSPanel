@@ -897,6 +897,9 @@ async function regenerateXrayConfigLocalOnly() {
   for (const inbound of byInbound.values()) {
     const internalPort = XRAY_BASE_PORT + Number(inbound.inbound_id);
     const reality = isRealityInbound(inbound);
+    // NOTE: TLS is terminated at the Railway/edge proxy — the panel forwards PLAIN HTTP
+    // to internal Xray inbounds, so internal security must be 'none' (except Reality,
+    // which is its own security layer and handles the handshake itself).
     const ib = {
       listen: "0.0.0.0",
       port: internalPort,
@@ -904,7 +907,7 @@ async function regenerateXrayConfigLocalOnly() {
       settings: { clients: inbound.clients, decryption: "none" },
       streamSettings: {
         network: inbound.protocol === 'tcp' && reality ? 'tcp' : inbound.protocol,
-        security: reality ? 'reality' : (inbound.tls === 'none' ? 'none' : 'tls'),
+        security: reality ? 'reality' : 'none',
         ...(reality ? {
           realitySettings: {
             show: false,
@@ -914,10 +917,7 @@ async function regenerateXrayConfigLocalOnly() {
             privateKey: getRealityKeypair().private_key,
             shortIds: [inbound.sid || '']
           }
-        } : {}),
-        ...(inbound.tls === 'none' && !reality ? {} : (!reality ? {
-          tlsSettings: { alpn: [inbound.alpn || 'http/1.1'], allowInsecure: false }
-        } : {}))
+        } : {})
       },
       sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
     };

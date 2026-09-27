@@ -96,7 +96,7 @@ db.serialize(() => {
     )
   `);
 
-  // migrations for old DB
+  // migrations for old DB (async callbacks, awaited at boot via ensureMigrations())
   db.all(`PRAGMA table_info(users)`, [], (err, cols) => {
     if (err) return;
     const hasSubToken = cols.some(c => c.name === 'sub_token');
@@ -120,6 +120,21 @@ db.serialize(() => {
     }
   });
 });
+
+// Idempotent, awaitable migration guard — guarantees Reality columns exist
+// before any query that references them (e.g. regenerateXrayConfigLocalOnly).
+async function ensureMigrations() {
+  const cols = await dbAll(`PRAGMA table_info(inbounds)`);
+  const names = new Set(cols.map(c => c.name));
+  const colsToAdd = { pbk: "TEXT DEFAULT ''", sid: "TEXT DEFAULT ''", sni: "TEXT DEFAULT ''", spx: "TEXT DEFAULT ''" };
+  for (const [col, def] of Object.entries(colsToAdd)) {
+    if (!names.has(col)) await dbRun(`ALTER TABLE inbounds ADD COLUMN ${col} ${def}`);
+  }
+  const ucols = await dbAll(`PRAGMA table_info(users)`);
+  if (!ucols.some(c => c.name === 'sub_token')) {
+    await dbRun(`ALTER TABLE users ADD COLUMN sub_token TEXT UNIQUE`);
+  }
+}
 
 // ========================= AUTH =========================
 function requireAuth(req, res, next) {
@@ -955,13 +970,53 @@ async function regenerateXrayConfigLocalOnly() {
 
 function restartXray() {
   if (xrayProcess) { xrayProcess.kill(); xrayProcess = null; }
-  if (!fs.existsSync(XRAY_CONFIG_PATH)) return;
+  if (!fs.existsSync(XRAY_CONFIG_PATH)) {
+    console.error('XRAY BOOT FAIL: config file missing at', XRAY_CONFIG_PATH);
+    return;
+  }
 
-  xrayProcess = spawn(XRAY_BIN, ['-c', XRAY_CONFIG_PATH]);
-  xrayProcess.stdout.on('data', d => console.log('XRAY:', d.toString().trim()));
-  xrayProcess.stderr.on('data', d => console.error('XRAY ERR:', d.toString().trim()));
-  xrayProcess.on('exit', code => console.log('Xray exited with code', code));
+  try {
+    xrayProcess = spawn(XRAY_BIN, ['-c', XRAY_CONFIG_PATH]);
+  } catch (e) {
+    console.error(`XRAY BOOT FAIL: cannot spawn "${XRAY_BIN}" (${e.message}). ` +
+      `Set XRAY_BIN to the full path of the xray binary. All protocol inbounds will return 502 until Xray runs.`);
+    xrayProcess = null;
+    return;
+  }
+
+  let started = false;
+  xrayProcess.stdout.on('data', d => {
+    const s = d.toString().trim();
+    if (!started && /started|Xray .*run/i.test(s)) started = true;
+    console.log('XRAY:', s);
+  });
+  xrayProcess.stderr.on('data', d => {
+    const s = d.toString().trim();
+    if (s) console.error('XRAY ERR:', s);
+  });
+  xrayProcess.on('error', (e) => {
+    console.error(`XRAY BOOT FAIL: spawn error "${e.message}" — xray binary not found or not executable. ` +
+      `All protocol inbounds will return 502 until Xray runs.`);
+    xrayProcess = null;
+  });
+  xrayProcess.on('exit', (code, sig) => {
+    console.error(`XRAY EXITED: code=${code} signal=${sig}. ` +
+      `Protocol inbounds will return 502 until Xray is running again. Check XRAY ERR lines above for config errors.`);
+    xrayProcess = null;
+  });
 }
+
+function isXrayRunning() { return !!xrayProcess && xrayProcess.exitCode === null && xrayProcess.pid; }
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    xray_running: isXrayRunning(),
+    xray_bin: XRAY_BIN,
+    inbounds_mapped: Object.keys(hostPathToPortMap).length,
+    role: NODE_ROLE
+  });
+});
 
 // ========================= PROXY =========================
 app.use((req, res) => {
@@ -1024,6 +1079,8 @@ server.on('upgrade', (req, socket, head) => {
 // ========================= BOOT =========================
 (async () => {
   try {
+    await ensureMigrations();
+
     // ensure all users have sub_token
     const us = await dbAll(`SELECT id, uuid FROM users`);
     for (const u of us) await ensureUserSubTokenByUuid(u.uuid);

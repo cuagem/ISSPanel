@@ -32,7 +32,6 @@ const XRAY_CONFIG_PATH = process.env.XRAY_CONFIG_PATH || '/tmp/xray-config.json'
 const XRAY_BIN = process.env.XRAY_BIN || 'xray';
 const REALITY_PRIVATE_KEY = process.env.REALITY_PRIVATE_KEY || '';
 const REALITY_DEST = process.env.REALITY_DEST || 'www.microsoft.com:443';  if (!fs.existsSync('./data')) fs.mkdirSync('./data', { recursive: true });
-  getRealityKeypair(); // ensure Reality keypair is ready at boot
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -821,6 +820,8 @@ let hostPathToPortMap = {};
 let pathToPortFallback = {};
 let xrayProcess = null;
 
+getRealityKeypair(); // ensure Reality keypair is ready (must run after declaration above)
+
 function updateRouteMaps(routeRows) {
   hostPathToPortMap = {};
   pathToPortFallback = {};
@@ -1034,6 +1035,7 @@ server.on('upgrade', (req, socket, head) => {
       console.log(`✅ Panel running on :${PORT}`);
       console.log(`Role: ${NODE_ROLE}`);
       console.log(`Admin: ${ADMIN_USER}`);
+      console.log(`Reality public key: ${getRealityKeypair().public_key}`);
     });
   } catch (e) {
     console.error('Boot error:', e);

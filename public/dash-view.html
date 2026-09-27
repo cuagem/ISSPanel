@@ -23,7 +23,7 @@
     <div class="bg-base-100 rounded-xl shadow p-4 flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
       <div>
         <h1 class="text-xl md:text-2xl font-bold">ISSPanel - Master/Remote</h1>
-        <p class="text-xs opacity-70">Subscription QR فعال شد (QR کوتاه و پایدار)</p>
+        <p class="text-xs opacity-70">پروتکل‌های ws / grpc / xhttp / Reality — بهینه‌شده برای حداکثر سرعت</p>
       </div>
       <div class="flex gap-2">
         <button class="btn btn-sm" onclick="refreshAll()">بروزرسانی</button>
@@ -164,27 +164,32 @@
         <div><label class="label">Port</label><input name="port" value="443" class="input input-bordered w-full" required /></div>
         <div>
           <label class="label">Protocol</label>
-          <select name="protocol" class="select select-bordered w-full">
+          <select name="protocol" id="inbound_protocol" class="select select-bordered w-full" onchange="toggleRealityFields()">
             <option value="ws">ws</option>
             <option value="grpc">grpc</option>
             <option value="xhttp">xhttp</option>
+            <option value="tcp">tcp (برای Reality)</option>
           </select>
         </div>
         <div><label class="label">Host</label><input name="host" class="input input-bordered w-full" required /></div>
         <div><label class="label">Path</label><input name="path" class="input input-bordered w-full" required /></div>
         <div>
-          <label class="label">TLS</label>
-          <select name="tls" class="select select-bordered w-full">
+          <label class="label">TLS / Security</label>
+          <select name="tls" id="inbound_tls" class="select select-bordered w-full" onchange="toggleRealityFields()">
             <option value="tls">tls</option>
             <option value="none">none</option>
+            <option value="reality">reality</option>
           </select>
         </div>
         <div>
-          <label class="label">FP</label>
+          <label class="label">FP (uTLS)</label>
           <select name="fp" class="select select-bordered w-full">
             <option value="chrome">chrome</option>
             <option value="firefox">firefox</option>
             <option value="ios">ios</option>
+            <option value="safari">safari</option>
+            <option value="edge">edge</option>
+            <option value="random">random</option>
             <option value="randomized">randomized</option>
           </select>
         </div>
@@ -195,6 +200,31 @@
             <option value="h2">h2</option>
             <option value="h3">h3</option>
           </select>
+        </div>
+        <div id="reality_fields" class="md:col-span-2 hidden border border-primary rounded-xl p-3">
+          <p class="text-xs mb-2 opacity-70">⚙️ تنظیمات Reality — مقادیر خالی را بگذارید تا خودکار تولید شوند (کلید سراسری پنل استفاده می‌شود).</p>
+          <div class="grid md:grid-cols-2 gap-3">
+            <div>
+              <label class="label">SNI (Server Name)</label>
+              <input name="sni" id="inbound_sni" class="input input-bordered w-full mono" placeholder="www.microsoft.com" oninput="syncSniToDest()" />
+            </div>
+            <div>
+              <label class="label">Dest (target سایت)</label>
+              <input name="reality_dest" id="inbound_reality_dest" class="input input-bordered w-full mono" value="www.microsoft.com:443" />
+            </div>
+            <div>
+              <label class="label">Public Key (pbk)</label>
+              <input name="pbk" class="input input-bordered w-full mono" placeholder="خودکار" />
+            </div>
+            <div>
+              <label class="label">Short ID (sid)</label>
+              <input name="sid" class="input input-bordered w-full mono" placeholder="خودکار" />
+            </div>
+            <div class="md:col-span-2">
+              <label class="label">SpiderX (spx)</label>
+              <input name="spx" class="input input-bordered w-full mono" placeholder="خودکار" />
+            </div>
+          </div>
         </div>
         <button class="btn btn-secondary md:col-span-2">ثبت</button>
       </form>
@@ -253,6 +283,7 @@
           <select name="tls" class="select select-bordered w-full">
             <option value="tls">tls</option>
             <option value="none">none</option>
+            <option value="reality">tls + reality اینباند اضافه</option>
           </select>
         </div>
         <div>
@@ -264,6 +295,18 @@
             <option value="randomized">randomized</option>
           </select>
         </div>
+        <div>
+          <label class="label">Reality Dest</label>
+          <input name="realityDest" value="www.microsoft.com:443" class="input input-bordered w-full mono" />
+        </div>
+        <div>
+          <label class="label">Reality SNI</label>
+          <input name="realitySni" placeholder="= dest host" class="input input-bordered w-full mono" />
+        </div>
+        <label class="label cursor-pointer justify-start gap-2 md:col-span-2">
+          <input type="checkbox" name="includeReality" value="true" checked class="checkbox checkbox-sm" />
+          <span class="label-text">افزودن اینباند Reality (tcp + reality) به پریست</span>
+        </label>
         <div class="md:col-span-2"><label class="label">Tag Prefix</label><input name="tagPrefix" value="af" class="input input-bordered w-full" /></div>
         <button class="btn btn-warning md:col-span-2">ایجاد پریست</button>
       </form>
@@ -298,6 +341,21 @@
     let users = [];
     let usersWithAccess = [];
     let currentQrText = '';
+
+    function toggleRealityFields() {
+      const tls = document.getElementById('inbound_tls').value;
+      const isReality = tls === 'reality';
+      document.getElementById('reality_fields').classList.toggle('hidden', !isReality);
+      if (isReality) {
+        document.getElementById('inbound_protocol').value = 'tcp';
+        syncSniToDest();
+      }
+    }
+    function syncSniToDest() {
+      const sni = document.getElementById('inbound_sni');
+      const dest = document.getElementById('inbound_reality_dest').value.split(':')[0];
+      if (!sni.value && dest) sni.value = dest;
+    }
 
     async function api(url, options = {}) {
       const res = await fetch(url, options);
@@ -456,7 +514,8 @@
       data.forEach((u, idx) => {
         const inbHtml = (u.inbounds || []).map(i => {
           const remote = i.is_remote ? '🛰️' : '🏠';
-          return `<span class="badge badge-outline m-1">${esc(i.panel_name)} ${remote} | ${esc(i.protocol)} | ${esc(i.host)}${esc(i.path)}</span>`;
+          const realityBadge = i.tls === 'reality' ? ' <span class="badge badge-primary badge-sm">Reality</span>' : '';
+          return `<span class="badge badge-outline m-1">${esc(i.panel_name)} ${remote} | ${esc(i.protocol)} | ${esc(i.host)}${esc(i.path)}</span>${realityBadge}`;
         }).join('') || '-';
 
         const allLinks = (u.links || []).map(l => l.link).join('\n');
@@ -519,7 +578,14 @@
       e.preventDefault();
       const data = Object.fromEntries(new FormData(e.target));
       const panelId = data.panel_id;
+      const realityDest = data.reality_dest;
       delete data.panel_id;
+      delete data.reality_dest;
+      if (data.tls !== 'reality') {
+        delete data.sni; delete data.pbk; delete data.sid; delete data.spx;
+      } else {
+        data.sni = data.sni || (realityDest || '').split(':')[0] || data.host;
+      }
       try {
         showResult(await api(`/api/panels/${panelId}/inbounds`, {
           method: 'POST',

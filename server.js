@@ -30,8 +30,9 @@ const COOKIE_VALUE = 'authenticated';
 
 const XRAY_CONFIG_PATH = process.env.XRAY_CONFIG_PATH || '/tmp/xray-config.json';
 const XRAY_BIN = process.env.XRAY_BIN || 'xray';
-
-if (!fs.existsSync('./data')) fs.mkdirSync('./data', { recursive: true });
+const REALITY_PRIVATE_KEY = process.env.REALITY_PRIVATE_KEY || '';
+const REALITY_DEST = process.env.REALITY_DEST || 'www.microsoft.com:443';  if (!fs.existsSync('./data')) fs.mkdirSync('./data', { recursive: true });
+  getRealityKeypair(); // ensure Reality keypair is ready at boot
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -96,12 +97,27 @@ db.serialize(() => {
     )
   `);
 
-  // migration for old DB
+  // migrations for old DB
   db.all(`PRAGMA table_info(users)`, [], (err, cols) => {
     if (err) return;
     const hasSubToken = cols.some(c => c.name === 'sub_token');
     if (!hasSubToken) {
       db.run(`ALTER TABLE users ADD COLUMN sub_token TEXT UNIQUE`);
+    }
+  });
+
+  db.all(`PRAGMA table_info(inbounds)`, [], (err, cols) => {
+    if (err) return;
+    const colsToAdd = {
+      pbk: "TEXT DEFAULT ''",
+      sid: "TEXT DEFAULT ''",
+      sni: "TEXT DEFAULT ''",
+      spx: "TEXT DEFAULT ''"
+    };
+    for (const [col, def] of Object.entries(colsToAdd)) {
+      if (!cols.some(c => c.name === col)) {
+        db.run(`ALTER TABLE inbounds ADD COLUMN ${col} ${def}`);
+      }
     }
   });
 });
@@ -131,6 +147,58 @@ function makeHostPathKey(host, path) { return `${normalizeHost(host)}|${normaliz
 function randomPath(prefix = '/v') { return normalizePath(`${prefix}-${crypto.randomBytes(8).toString('hex')}`); }
 function randomTag(prefix = 'ib') { return `${prefix}-${crypto.randomBytes(3).toString('hex')}`; }
 function makeSubToken() { return crypto.randomBytes(18).toString('base64url'); }
+
+// Reality key management: one global X25519 keypair, persisted to disk (or via env).
+// Xray needs the private key in its config; links need the public key (pbk).
+function generateRealityKeypair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519');
+  const pubRaw = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+  const privRaw = privateKey.export({ type: 'pkcs8', format: 'der' }).subarray(-32);
+  return {
+    public_key: pubRaw.toString('base64url'),
+    private_key: privRaw.toString('base64url')
+  };
+}
+
+let REALITY_KEYPAIR = null;
+function getRealityKeypair() {
+  if (REALITY_KEYPAIR) return REALITY_KEYPAIR;
+  if (REALITY_PRIVATE_KEY) {
+    // derive nothing extra: use env private key; public key derived via X25519
+    try {
+      const privRaw = Buffer.from(REALITY_PRIVATE_KEY, 'base64url');
+      const privKey = crypto.createPrivateKey({ key: Buffer.concat([
+        Buffer.from('302e020100300506032b656e04220420', 'hex'), privRaw
+      ]), format: 'der', type: 'pkcs8' });
+      const pubRaw = crypto.createPublicKey(privKey).export({ type: 'spki', format: 'der' }).subarray(-32);
+      REALITY_KEYPAIR = { public_key: pubRaw.toString('base64url'), private_key: REALITY_PRIVATE_KEY };
+      return REALITY_KEYPAIR;
+    } catch (e) {
+      console.error('Invalid REALITY_PRIVATE_KEY, generating new keypair:', e.message);
+    }
+  }
+  const keyFile = './data/reality-key.json';
+  try {
+    if (fs.existsSync(keyFile)) {
+      REALITY_KEYPAIR = JSON.parse(fs.readFileSync(keyFile, 'utf8'));
+      return REALITY_KEYPAIR;
+    }
+  } catch {}
+  REALITY_KEYPAIR = generateRealityKeypair();
+  try { fs.writeFileSync(keyFile, JSON.stringify(REALITY_KEYPAIR, null, 2), { mode: 0o600 }); } catch {}
+  return REALITY_KEYPAIR;
+}
+
+// Generate per-inbound Reality params: uses the global keypair's public key
+function generateRealityKeys() {
+  const kp = getRealityKeypair();
+  return {
+    public_key: kp.public_key,
+    short_id: crypto.randomBytes(4).toString('hex'),
+    spider_x: '/' + crypto.randomBytes(8).toString('hex')
+  };
+}
+function isRealityInbound(row) { return String(row.tls || '').toLowerCase() === 'reality'; }
 
 function dbGet(sql, params = []) {
   return new Promise((resolve, reject) => db.get(sql, params, (e, r) => e ? reject(e) : resolve(r)));
@@ -210,6 +278,22 @@ function buildVlessLink(row) {
   }
   if (row.protocol === 'xhttp') params.set('mode', 'auto');
 
+  if (isRealityInbound(row)) {
+    // Reality: security=reality, sni = dest-based sni, pbk/sid/spx required
+    params.set('security', 'reality');
+    params.set('sni', row.sni || row.host);
+    if (row.pbk) params.set('pbk', row.pbk);
+    if (row.sid) params.set('sid', row.sid);
+    if (row.spx) params.set('spx', row.spx);
+    params.delete('host');
+    params.delete('path');
+    params.delete('alpn');
+    params.delete('allowInsecure');
+    if (row.protocol === 'grpc') params.set('serviceName', row.path.replace(/^\//, ''));
+    if (row.protocol === 'ws' || row.protocol === 'xhttp') params.set('path', row.path);
+    if (row.protocol === 'xhttp') params.set('mode', 'auto');
+  }
+
   const label = `${row.username}-${row.panel_name || 'panel'}-${row.tag || ('inb' + row.inbound_id)}`;
   return `vless://${row.uuid}@${row.address}:${row.external_port}?${params.toString()}#${encodeURIComponent(label)}`;
 }
@@ -219,6 +303,7 @@ async function getUserLinksByUserId(userId) {
     SELECT
       u.username, u.uuid,
       i.id AS inbound_id, i.tag, i.protocol, i.host, i.path, i.tls, i.fp, i.alpn,
+      i.pbk, i.sid, i.sni, i.spx,
       i.port AS external_port,
       p.name AS panel_name, p.address
     FROM user_inbound_access a
@@ -291,6 +376,10 @@ app.get('/sub64/:token', async (req, res) => {
 
 // ========================= MASTER APIs =========================
 if (isMasterEnabled()) {
+  app.get('/api/reality/keys', requireAuth, (req, res) => {
+    res.json({ public_key: getRealityKeypair().public_key, dest: REALITY_DEST });
+  });
+
   app.get('/api/panels', requireAuth, async (req, res) => {
     try { res.json(await dbAll(`SELECT * FROM panels ORDER BY id DESC`)); }
     catch (e) { res.status(500).json({ error: e.message }); }
@@ -325,13 +414,27 @@ if (isMasterEnabled()) {
   app.post('/api/panels/:panelId/inbounds', requireAuth, async (req, res) => {
     try {
       const panelId = Number(req.params.panelId);
-      let { tag, port, protocol, host, path, tls, fp, alpn } = req.body;
+      let { tag, port, protocol, host, path, tls, fp, alpn, sni, pbk, sid, spx } = req.body;
 
       if (!port || !protocol || !host || !path) return res.status(400).json({ error: 'port, protocol, host, path are required' });
-      if (!['ws', 'xhttp', 'grpc'].includes(protocol)) return res.status(400).json({ error: 'protocol must be ws|xhttp|grpc' });
+      if (!['ws', 'xhttp', 'grpc', 'tcp'].includes(protocol)) return res.status(400).json({ error: 'protocol must be ws|xhttp|grpc|tcp' });
+
+      tls = String(tls || 'tls').toLowerCase();
+      if (!['tls', 'none', 'reality'].includes(tls)) return res.status(400).json({ error: 'tls must be tls|none|reality' });
 
       path = normalizePath(path);
       if (alpn === 'h2' || alpn === 'h3') alpn = 'http/1.1';
+
+      let reality = null;
+      if (tls === 'reality') {
+        if (!pbk || !sid) {
+          reality = generateRealityKeys();
+          pbk = pbk || reality.public_key;
+          sid = sid || reality.short_id;
+          if (!spx) spx = reality.spider_x;
+        }
+        if (!sni) sni = String(host).trim();
+      }
 
       const panel = await getPanelById(panelId);
       if (!panel) return res.status(404).json({ error: 'panel not found' });
@@ -340,15 +443,16 @@ if (isMasterEnabled()) {
       if (Number(panel.is_remote) === 1) {
         const r = await remoteCall(panel, 'POST', '/agent/inbounds', {
           tag: tag || '', port: String(port), protocol, host: String(host).trim(), path,
-          tls: tls || 'tls', fp: fp || 'chrome', alpn: alpn || 'http/1.1'
+          tls, fp: fp || 'chrome', alpn: alpn || 'http/1.1',
+          sni: sni || '', pbk: pbk || '', sid: sid || '', spx: spx || ''
         });
         remoteInboundId = String(r.remote_inbound_id || r.id || '');
       }
 
       const ins = await dbRun(
-        `INSERT INTO inbounds (panel_id, remote_inbound_id, tag, port, protocol, host, path, tls, fp, alpn)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [panelId, remoteInboundId, tag || '', String(port), protocol, String(host).trim(), path, tls || 'tls', fp || 'chrome', alpn || 'http/1.1']
+        `INSERT INTO inbounds (panel_id, remote_inbound_id, tag, port, protocol, host, path, tls, fp, alpn, pbk, sid, sni, spx)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [panelId, remoteInboundId, tag || '', String(port), protocol, String(host).trim(), path, tls, fp || 'chrome', alpn || 'http/1.1', pbk || '', sid || '', sni || '', spx || '']
       );
 
       if (Number(panel.is_remote) === 0) {
@@ -366,31 +470,50 @@ if (isMasterEnabled()) {
       const panel = await getPanelById(panelId);
       if (!panel) return res.status(404).json({ error: 'panel not found' });
 
-      const { host, port = '443', tls = 'tls', fp = 'chrome', tagPrefix = 'af' } = req.body;
+      const { host, port = '443', tls = 'tls', fp = 'chrome', tagPrefix = 'af', includeReality = true, realityDest = 'www.microsoft.com:443', realitySni = '' } = req.body;
       if (!host) return res.status(400).json({ error: 'host is required' });
 
+      const useReality = String(tls).toLowerCase() === 'reality';
       const presets = [
         { protocol: 'ws', path: randomPath('/ws'), tag: randomTag(`${tagPrefix}-ws`), alpn: 'http/1.1' },
         { protocol: 'grpc', path: randomPath('/grpc'), tag: randomTag(`${tagPrefix}-grpc`), alpn: 'http/1.1' },
         { protocol: 'xhttp', path: randomPath('/xhttp'), tag: randomTag(`${tagPrefix}-xhttp`), alpn: 'http/1.1' },
       ];
 
+      if (includeReality) {
+        const rk = generateRealityKeys();
+        presets.push({
+          protocol: 'tcp',
+          path: '/' + crypto.randomBytes(4).toString('hex'),
+          tag: randomTag(`${tagPrefix}-reality`),
+          alpn: '',
+          tls: 'reality',
+          pbk: rk.public_key,
+          sid: rk.short_id,
+          sni: realitySni || realityDest.split(':')[0],
+          spx: rk.spider_x,
+          reality_dest: realityDest
+        });
+      }
+
       const created = [];
       for (const p of presets) {
         let remoteInboundId = '';
+        const pTls = p.tls || tls;
 
         if (Number(panel.is_remote) === 1) {
           const r = await remoteCall(panel, 'POST', '/agent/inbounds', {
             tag: p.tag, port: String(port), protocol: p.protocol, host: String(host).trim(),
-            path: p.path, tls, fp, alpn: p.alpn
+            path: p.path, tls: pTls, fp, alpn: p.alpn || 'http/1.1',
+            sni: p.sni || '', pbk: p.pbk || '', sid: p.sid || '', spx: p.spx || ''
           });
           remoteInboundId = String(r.remote_inbound_id || r.id || '');
         }
 
         const ins = await dbRun(
-          `INSERT INTO inbounds (panel_id, remote_inbound_id, tag, port, protocol, host, path, tls, fp, alpn)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [panelId, remoteInboundId, p.tag, String(port), p.protocol, String(host).trim(), p.path, tls, fp, p.alpn]
+          `INSERT INTO inbounds (panel_id, remote_inbound_id, tag, port, protocol, host, path, tls, fp, alpn, pbk, sid, sni, spx)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [panelId, remoteInboundId, p.tag, String(port), p.protocol, String(host).trim(), p.path, pTls, fp, p.alpn || 'http/1.1', p.pbk || '', p.sid || '', p.sni || '', p.spx || '']
         );
 
         created.push({ id: ins.lastID, remote_inbound_id: remoteInboundId || null, ...p, host, port: String(port) });
@@ -496,6 +619,7 @@ if (isMasterEnabled()) {
         SELECT
           u.id AS user_id, u.username, u.uuid, u.sub_token,
           i.id AS inbound_id, i.tag, i.protocol, i.host, i.path, i.tls, i.fp, i.alpn,
+          i.pbk, i.sid, i.sni, i.spx,
           i.port AS external_port,
           p.name AS panel_name, p.address, p.is_remote
         FROM users u
@@ -538,6 +662,7 @@ if (isMasterEnabled()) {
             protocol: r.protocol,
             host: r.host,
             path: r.path,
+            tls: r.tls,
             link: buildVlessLink({ ...r, username: r.username, panel_name: r.panel_name })
           });
         }
@@ -613,12 +738,23 @@ if (isAgentEnabled()) {
 
   app.post('/agent/inbounds', requireAgent, async (req, res) => {
     try {
-      let { tag, port, protocol, host, path, tls, fp, alpn } = req.body;
+      let { tag, port, protocol, host, path, tls, fp, alpn, sni, pbk, sid, spx } = req.body;
       if (!port || !protocol || !host || !path) return res.status(400).json({ error: 'port, protocol, host, path are required' });
-      if (!['ws', 'xhttp', 'grpc'].includes(protocol)) return res.status(400).json({ error: 'protocol must be ws|xhttp|grpc' });
+      if (!['ws', 'xhttp', 'grpc', 'tcp'].includes(protocol)) return res.status(400).json({ error: 'protocol must be ws|xhttp|grpc|tcp' });
+
+      tls = String(tls || 'tls').toLowerCase();
+      if (!['tls', 'none', 'reality'].includes(tls)) return res.status(400).json({ error: 'tls must be tls|none|reality' });
 
       path = normalizePath(path);
       if (alpn === 'h2' || alpn === 'h3') alpn = 'http/1.1';
+
+      if (tls === 'reality' && (!pbk || !sid)) {
+        const rk = generateRealityKeys();
+        pbk = pbk || rk.public_key;
+        sid = sid || rk.short_id;
+        spx = spx || rk.spider_x;
+      }
+      if (tls === 'reality' && !sni) sni = String(host).trim();
 
       let localPanel = await dbGet(`SELECT * FROM panels WHERE is_remote = 0 ORDER BY id ASC LIMIT 1`);
       if (!localPanel) {
@@ -631,9 +767,9 @@ if (isAgentEnabled()) {
       }
 
       const ins = await dbRun(
-        `INSERT INTO inbounds (panel_id, tag, port, protocol, host, path, tls, fp, alpn)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [localPanel.id, tag || randomTag('ag'), String(port), protocol, String(host).trim(), path, tls || 'tls', fp || 'chrome', alpn || 'http/1.1']
+        `INSERT INTO inbounds (panel_id, tag, port, protocol, host, path, tls, fp, alpn, pbk, sid, sni, spx)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [localPanel.id, tag || randomTag('ag'), String(port), protocol, String(host).trim(), path, tls, fp || 'chrome', alpn || 'http/1.1', pbk || '', sid || '', sni || '', spx || '']
       );
 
       await regenerateXrayConfigLocalOnly();
@@ -711,7 +847,7 @@ function getTargetPort(reqLike) {
 
 async function regenerateXrayConfigLocalOnly() {
   const rows = await dbAll(`
-    SELECT u.username, u.uuid, i.id AS inbound_id, i.protocol, i.host, i.path
+    SELECT u.username, u.uuid, i.id AS inbound_id, i.protocol, i.host, i.path, i.tls, i.fp, i.alpn, i.pbk, i.sid, i.sni, i.spx
     FROM user_inbound_access a
     JOIN users u ON u.id = a.user_id
     JOIN inbounds i ON i.id = a.inbound_id
@@ -728,6 +864,11 @@ async function regenerateXrayConfigLocalOnly() {
         protocol: r.protocol,
         host: r.host,
         path: r.path,
+        tls: r.tls,
+        sni: r.sni,
+        pbk: r.pbk,
+        sid: r.sid,
+        spx: r.spx,
         clients: []
       });
     }
@@ -739,13 +880,30 @@ async function regenerateXrayConfigLocalOnly() {
 
   for (const inbound of byInbound.values()) {
     const internalPort = XRAY_BASE_PORT + Number(inbound.inbound_id);
+    const reality = isRealityInbound(inbound);
     const ib = {
-      listen: "127.0.0.1",
+      listen: "0.0.0.0",
       port: internalPort,
       protocol: "vless",
       settings: { clients: inbound.clients, decryption: "none" },
-      streamSettings: { network: inbound.protocol, security: "none" },
-      sniffing: { enabled: true, destOverride: ["http", "tls"] }
+      streamSettings: {
+        network: inbound.protocol === 'tcp' && reality ? 'tcp' : inbound.protocol,
+        security: reality ? 'reality' : (inbound.tls === 'none' ? 'none' : 'tls'),
+        ...(reality ? {
+          realitySettings: {
+            show: false,
+            dest: REALITY_DEST,
+            xver: 0,
+            serverNames: [inbound.sni || REALITY_DEST.split(':')[0]],
+            privateKey: getRealityKeypair().private_key,
+            shortIds: [inbound.sid || '']
+          }
+        } : {}),
+        ...(inbound.tls === 'none' && !reality ? {} : (!reality ? {
+          tlsSettings: { alpn: [inbound.alpn || 'http/1.1'], allowInsecure: false }
+        } : {}))
+      },
+      sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
     };
 
     if (inbound.protocol === 'ws') {
@@ -753,7 +911,9 @@ async function regenerateXrayConfigLocalOnly() {
     } else if (inbound.protocol === 'xhttp') {
       ib.streamSettings.xhttpSettings = { path: inbound.path, host: inbound.host, mode: "auto" };
     } else if (inbound.protocol === 'grpc') {
-      ib.streamSettings.grpcSettings = { serviceName: inbound.path.replace(/^\//, '') };
+      ib.streamSettings.grpcSettings = { serviceName: inbound.path.replace(/^\//, ''), multiMode: true, idle_timeout: 60, health_check_timeout: 20 };
+    } else if (inbound.protocol === 'tcp') {
+      ib.streamSettings.tcpSettings = { header: { type: 'none' } };
     }
 
     inbounds.push(ib);
@@ -772,8 +932,20 @@ async function regenerateXrayConfigLocalOnly() {
 
   const config = {
     log: { loglevel: "warning" },
+    dns: {
+      servers: ["1.1.1.1", "8.8.8.8", { address: "https+local://cloudflare-dns.com/dns-query", detour: "direct" }],
+      queryStrategy: "UseIPv4"
+    },
     inbounds,
-    outbounds: [{ protocol: "freedom", tag: "direct" }, { protocol: "blackhole", tag: "block" }]
+    outbounds: [
+      {
+        protocol: "freedom",
+        tag: "direct",
+        settings: { domainStrategy: "UseIP", fragment: { packets: "tlshello", length: "100-200", interval: "10-20" } },
+        sockopt: { tcpFastOpen: true, tcpNoDelay: true, tcpKeepAliveIdle: 100, tcpMaxSeg: 1440 }
+      },
+      { protocol: "blackhole", tag: "block" }
+    ]
   };
 
   fs.writeFileSync(XRAY_CONFIG_PATH, JSON.stringify(config, null, 2));
